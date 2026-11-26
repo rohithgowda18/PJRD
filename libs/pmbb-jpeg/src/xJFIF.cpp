@@ -1,0 +1,761 @@
+/*
+    SPDX-FileCopyrightText: 2020-2025 Jakub Stankowski <jakub.stankowski@put.poznan.pl>
+    SPDX-FileCopyrightText: 2025      Artur Fojut      <artur.fojut@student.put.poznan.pl>
+    SPDX-License-Identifier: BSD-3-Clause
+*/
+#include "xJFIF.h"
+
+namespace PMBB_NAMESPACE::JPEG {
+
+//=============================================================================================================================================================================
+// APP0
+//=============================================================================================================================================================================
+int32 xJFIF::xAPP0::Absorb(xByteBuffer* Input, int32 SegmentLength)
+{
+  [[maybe_unused]]uint32 JFIF = xReadFourCC(Input); //Identifier: ASCII "JFIF"
+  [[maybe_unused]]uint8  Null = xRead8     (Input); //Identifier: ASCII "NULL"
+  m_VersionMajor              = xRead8     (Input); //Major version
+  m_VersionMinor              = xRead8     (Input); //Minor version
+  m_DensityUnits              = xRead8     (Input); //Density unit
+  m_DensityX                  = xRead16    (Input); //Density X
+  m_DensityY                  = xRead16    (Input); //Density Y
+  m_ThumbnailSizeX            = xRead8     (Input); //Thumbnail size X
+  m_ThumbnailSizeY            = xRead8     (Input); //Thumbnail size X
+
+  int32 CurrentLength  = 16;
+  int32 RemainingBytes = SegmentLength - CurrentLength;
+  int32 ThumbnailSize  = m_ThumbnailSizeX * m_ThumbnailSizeY * 3; //RGB
+
+  if(RemainingBytes != 0 && ThumbnailSize == RemainingBytes)
+  {
+    m_ThumbnailData.resize(ThumbnailSize);
+    xReadVector(m_ThumbnailData, Input);    
+    CurrentLength += ThumbnailSize;
+  }
+
+  return getLength();
+}
+int32 xJFIF::xAPP0::Emit(xByteBuffer* Output) const
+{
+  xWriteFourCC(Output, xJFIF::c_JFIF           ); //Identifier: ASCII "JFIF"
+  xWrite8     (Output, 0x00                    ); //Identifier: ASCII "NULL" 
+  xWrite8     (Output, (uint8 )m_VersionMajor  ); //Major version
+  xWrite8     (Output, (uint8 )m_VersionMinor  ); //Minor version
+  xWrite8     (Output, (uint8 )m_DensityUnits  ); //Density unit
+  xWrite16    (Output, (uint16)m_DensityX      ); //Density X
+  xWrite16    (Output, (uint16)m_DensityY      ); //Density Y
+  xWrite8     (Output, (uint8 )m_ThumbnailSizeX); //Thumbnail size X
+  xWrite8     (Output, (uint8 )m_ThumbnailSizeY); //Thumbnail size X
+
+  if(m_ThumbnailSizeX * m_ThumbnailSizeY > 0) { xWriteVector(Output, m_ThumbnailData); }
+
+  return getLength();
+}
+void xJFIF::xAPP0::InitDefault()
+{
+  m_VersionMajor   = 1;
+  m_VersionMinor   = 1;
+  m_DensityUnits   = 0; //No units
+  m_DensityX       = 1;
+  m_DensityY       = 1;
+  m_ThumbnailSizeX = 0;
+  m_ThumbnailSizeY = 0;
+  m_ThumbnailData.clear();
+}
+bool xJFIF::xAPP0::Validate()
+{
+  bool Valid = xFitsU8(m_VersionMajor) && xFitsU8(m_VersionMinor)
+    && xFitsU8(m_DensityUnits) && xFitsU16(m_DensityX) && xFitsU16(m_DensityX)
+    && xFitsU8(m_ThumbnailSizeX) && xFitsU8(m_ThumbnailSizeY);
+  if(m_VersionMajor != 1) { Valid = false; }
+  if(m_VersionMinor <  1) { Valid = false; }
+  return Valid;
+}
+
+//=============================================================================================================================================================================
+// DQT
+//=============================================================================================================================================================================
+int32 xJFIF::xQuantTable::Absorb(xByteBuffer* Input)
+{
+  uint8 QuantTabInfo = xRead8(Input );
+  m_Precision        = (QuantTabInfo & 0xF0) >> 4;
+  m_Idx              = QuantTabInfo & 0x0F;
+  int32 QuantTabSize = m_Precision ? 128 : 64;
+  m_Table.resize(QuantTabSize);
+  xReadVector(m_Table, Input);
+  return 1 + QuantTabSize;
+}
+int32 xJFIF::xQuantTable::Emit(xByteBuffer* Output) const
+{
+  xWrite8     (Output, ((m_Precision & 0x01) << 4) | (m_Idx & 0x03)); //Precision / Table idx
+  xWriteVector(Output, m_Table); //Luma quant table
+  return 1 + (int32)m_Table.size();
+}
+void xJFIF::xQuantTable::Init(uint8 Idx, eCmp Cmp, int32 Quality, eQTLa QuantTabLayout)
+{
+  m_Precision = 0;
+  m_Idx       = Idx;
+  m_Table.resize(64);
+  xJPEG_Constants::GenerateQuantTable(m_Table.data(), Cmp, Quality, QuantTabLayout);
+}
+bool xJFIF::xQuantTable::Validate() const
+{
+  return true;
+}
+xJFIF::tStr xJFIF::xQuantTable::Format(const tStr& Prefix) const
+{
+  std::string Result = fmt::format("{}Table Idx={:d} Precision={:d}\n", Prefix, m_Idx, m_Precision);
+
+  for(int32 y = 0; y < xJPEG_Constants::c_BlockSize; y++)
+  {
+    Result += Prefix;
+    for(int32 x = 0; x < xJPEG_Constants::c_BlockSize; x++)
+    {
+      Result += fmt::format("{:>3d} ", m_Table[(y << xJPEG_Constants::c_Log2BlockSize) + x]);
+    }
+    Result += "\n";
+  }
+  return Result;
+}
+
+//=============================================================================================================================================================================
+// SOF
+//=============================================================================================================================================================================
+int32 xJFIF::xSOF::Absorb(xByteBuffer* Input)
+{
+  m_BitDepth      = xRead8 (Input); //Bits per sample
+  m_Height        = xRead16(Input); //Height
+  m_Width         = xRead16(Input); //Width
+  m_NumComponents = xRead8 (Input); //Num components
+  for(int32 CmpIdx = 0; CmpIdx < m_NumComponents; CmpIdx++)
+  {
+    m_CmpId         [CmpIdx] = (eCmp)xRead8(Input);
+    m_SamplingFactor[CmpIdx] = xRead8(Input);
+    m_QuantTableId  [CmpIdx] = xRead8(Input);
+  }
+  return getLength();
+}
+int32 xJFIF::xSOF::Emit(xByteBuffer* Output) const
+{
+  xWrite8     (Output, (uint8 )m_BitDepth     ); //Bits per sample
+  xWrite16    (Output, (uint16)m_Height       ); //Height
+  xWrite16    (Output, (uint16)m_Width        ); //Width
+  xWrite8     (Output, (uint8 )m_NumComponents); //Num components
+
+  for(int32 CmpIdx = 0; CmpIdx < m_NumComponents; CmpIdx++)
+  {
+    xWrite8(Output, (uint8)m_CmpId         [CmpIdx]);
+    xWrite8(Output, (uint8)m_SamplingFactor[CmpIdx]);
+    xWrite8(Output, (uint8)m_QuantTableId  [CmpIdx]);
+  }
+  return getLength();
+}
+eCrF xJFIF::xSOF::DetermineChromaFormat() const
+{
+  eCrF ChromaFormat = eCrF::INVALID;
+  if(m_NumComponents == 1) { ChromaFormat = eCrF::CF400; }
+  else if(GetSamplingFactorH(1)==1 && GetSamplingFactorV(1)==1 && GetSamplingFactorH(2)==1 && GetSamplingFactorV(2)==1)
+  {
+    if     (GetSamplingFactorH(0) == 1 && GetSamplingFactorV(0)==1) { ChromaFormat = eCrF::CF444; }
+    else if(GetSamplingFactorH(0) == 2 && GetSamplingFactorV(0)==1) { ChromaFormat = eCrF::CF422; }
+    else if(GetSamplingFactorH(0) == 2 && GetSamplingFactorV(0)==2) { ChromaFormat = eCrF::CF420; }
+  }
+  return ChromaFormat;
+}
+void xJFIF::xSOF::Init(int32 Type, int32 Height, int32 Width, int32 BitDepth, eCrF ChromaFormat, int32 NumQuantTables)
+{
+  m_Type          = Type;
+  m_Height        = Height;
+  m_Width         = Width;
+  m_BitDepth      = BitDepth;
+  m_NumComponents = ChromaFormat != eCrF::CF400 ? 3 : 1;
+  switch(ChromaFormat)
+  {
+    case eCrF::CF444: m_CmpId[(int32)eCmp::LM] = eCmp::LM; m_SamplingFactor[(int32)eCmp::LM] = ((1 << 4) + (1)); m_QuantTableId[(int32)eCmp::LM] = 0; break; //Lm - cmp idx, sampling factor H / sampling factor V, quant table idx
+    case eCrF::CF422: m_CmpId[(int32)eCmp::LM] = eCmp::LM; m_SamplingFactor[(int32)eCmp::LM] = ((2 << 4) + (1)); m_QuantTableId[(int32)eCmp::LM] = 0; break; //Lm - cmp idx, sampling factor H / sampling factor V, quant table idx
+    case eCrF::CF420: m_CmpId[(int32)eCmp::LM] = eCmp::LM; m_SamplingFactor[(int32)eCmp::LM] = ((2 << 4) + (2)); m_QuantTableId[(int32)eCmp::LM] = 0; break; //Lm - cmp idx, sampling factor H / sampling factor V, quant table idx
+    case eCrF::CF400: m_CmpId[(int32)eCmp::LM] = eCmp::LM; m_SamplingFactor[(int32)eCmp::LM] = ((1 << 4) + (1)); m_QuantTableId[(int32)eCmp::LM] = 0; break; //Lm - cmp idx, sampling factor H / sampling factor V, quant table idx
+    default: assert(0); break;
+  }
+  if(ChromaFormat != eCrF::CF400)
+  {    
+    m_CmpId[(int32)eCmp::CB] = eCmp::CB; m_SamplingFactor[(int32)eCmp::CB] = ((1 << 4) + (1)); m_QuantTableId[(int32)eCmp::CB] = (int8)xMin(1, NumQuantTables - 1); //Cb - cmp idx, sampling factor H / sampling factor V, quant table idx
+    m_CmpId[(int32)eCmp::CR] = eCmp::CR; m_SamplingFactor[(int32)eCmp::CR] = ((1 << 4) + (1)); m_QuantTableId[(int32)eCmp::CR] = (int8)xMin(2, NumQuantTables - 1); //Cr - cmp idx, sampling factor H / sampling factor V, quant table idx
+  }
+}
+bool xJFIF::xSOF::Validate() const
+{
+  return true;
+}
+
+//=============================================================================================================================================================================
+// DHT
+//=============================================================================================================================================================================
+int32 xJFIF::xHuffTable::Absorb(xByteBuffer* Input)
+{
+  uint8 TabInfo = xRead8(Input );
+  m_Class = (tClass)((TabInfo & 0xF0) >> 4);
+  m_Idx   = TabInfo & 0x0F;
+  xReadMemmory(m_CodeLengths.data(), 16, Input);
+  int32 NumSymbols = 0;
+  for(int32 i=0; i < 16; i++) { NumSymbols += m_CodeLengths[i]; }
+  m_CodeSymbols.resize(NumSymbols);
+  xReadVector(m_CodeSymbols, Input );
+  return 1 + 16 + NumSymbols;
+}
+int32 xJFIF::xHuffTable::Emit(xByteBuffer* Output) const
+{
+  xWrite8      (Output, ((uint8)m_Class<<4) + m_Idx);
+  xWriteMemmory(Output, m_CodeLengths.data(), 16);
+  xWriteVector (Output, m_CodeSymbols);
+  return getLength();
+}
+void xJFIF::xHuffTable::InitDefault(uint8 Idx, tClass Class, eCmp Cmp)
+{
+  m_Class = Class;
+  m_Idx   = Idx;
+
+  if(Cmp == eCmp::LM)
+  {
+    if(Class == tClass::DC)
+    {
+      memcpy(m_CodeLengths.data(), xJPEG_Constants::m_CodeLengthLumaDC, sizeof(xJPEG_Constants::m_CodeLengthLumaDC));
+      m_CodeSymbols.assign((const byte*)xJPEG_Constants::m_CodeSymbolLumaDC, (const byte*)xJPEG_Constants::m_CodeSymbolLumaDC+sizeof(xJPEG_Constants::m_CodeSymbolLumaDC));
+    }
+    else if(Class == tClass::AC)
+    {
+      memcpy(m_CodeLengths.data(), xJPEG_Constants::m_CodeLengthLumaAC, sizeof(xJPEG_Constants::m_CodeLengthLumaAC));
+      m_CodeSymbols.assign((const byte*)xJPEG_Constants::m_CodeSymbolLumaAC, (const byte*)xJPEG_Constants::m_CodeSymbolLumaAC+sizeof(xJPEG_Constants::m_CodeSymbolLumaAC));
+    }
+  }
+  else
+  {
+    if(Class == tClass::DC)
+    {
+      memcpy(m_CodeLengths.data(), xJPEG_Constants::m_CodeLengthChromaDC, sizeof(xJPEG_Constants::m_CodeLengthChromaDC));
+      m_CodeSymbols.assign((const byte*)xJPEG_Constants::m_CodeSymbolChromaDC, (const byte*)xJPEG_Constants::m_CodeSymbolChromaDC+sizeof(xJPEG_Constants::m_CodeSymbolChromaDC));
+    }
+    else if(Class == tClass::AC)
+    {
+      memcpy(m_CodeLengths.data(), xJPEG_Constants::m_CodeLengthChromaAC, sizeof(xJPEG_Constants::m_CodeLengthChromaAC));
+      m_CodeSymbols.assign((const byte*)xJPEG_Constants::m_CodeSymbolChromaAC, (const byte*)xJPEG_Constants::m_CodeSymbolChromaAC+sizeof(xJPEG_Constants::m_CodeSymbolChromaAC));
+    }
+  }
+}
+void xJFIF::xHuffTable::InitCustom(uint8 Idx, tClass Class, const uint8* LengthTable)
+{
+  m_Class = Class;
+  m_Idx   = Idx;
+
+  m_CodeSymbols.clear();
+
+  const int32 MaxSymbol = getMaxNumCodeSymbols();
+  std::array<uint8, 32> TmpHuffLen = { 0 };
+  for(int32 i = 0; i <= MaxSymbol; i++)
+  {
+    int32 Length = LengthTable[i];
+
+    if(Length > 0 && Length <= MaxSymbol)
+    {
+      TmpHuffLen[Length - 1]++;
+    }
+  }
+
+  // Procedure for limiting code lengths to 16 bits
+  uint8 Index = 31;
+  while(Index > 15)
+  {
+    if(TmpHuffLen[Index] == 0) { Index--; continue; }
+    uint8 j = Index - 2;
+    while(j > 0 && TmpHuffLen[j] == 0) { j--; }
+    TmpHuffLen[Index    ] -= 2;
+    TmpHuffLen[Index - 1]++;
+    TmpHuffLen[j     + 1] += 2;
+    TmpHuffLen[j        ]--;
+  }
+  while(Index > 0 && TmpHuffLen[Index] == 0) { Index--; }
+
+  TmpHuffLen[Index]--;
+
+  for(int32 i = 0; i < 16; i++) { m_CodeLengths[i] = TmpHuffLen[i]; }
+
+  int32 NumLengths = 0;
+  for(int32 i = 0; i < (int32)m_CodeLengths.size(); i++) { NumLengths += m_CodeLengths[i]; }
+
+  std::vector<std::pair<uint16, uint16>> ValueIndexPairs(MaxSymbol);
+  for(int32 i = 0; i < MaxSymbol; i++) { ValueIndexPairs[i] = { LengthTable[i], (uint16)i }; }
+
+  std::sort(ValueIndexPairs.begin(), ValueIndexPairs.end(),
+    [](const std::pair<uint16_t, uint16>& a, const std::pair<uint16_t, uint16>& b)
+    {
+      if     (a.first == 0 && b.first != 0) { return false;             }
+      else if(a.first != 0 && b.first == 0) { return true ;             }
+      else                                  { return a.first < b.first; } //regular comparison for non-zero values
+    });
+
+  uint16 Count = 0;
+  for(const auto& pair : ValueIndexPairs)
+  {
+    if(Count >= NumLengths) { break; }
+    m_CodeSymbols.push_back(static_cast<byte>(pair.second));
+    ++Count;
+  }
+}
+xJFIF::tStr xJFIF::xHuffTable::Format(const tStr& Prefix) const
+{
+  std::string Result = fmt::format("{}Table Idx={:d} Class={:s}({:d})\n", Prefix, m_Idx, xEntropyTableClass2Str(m_Class), (int32)m_Class);
+  Result += Prefix + "CodeLengths=";
+  for(int32 i = 0; i < xJPEG_Constants::c_NumCodeLenghts; i++) { Result += fmt::format("{:d} ", m_CodeLengths[i]); } Result += "\n";
+  Result += Prefix + "CodeSymbols=";
+  for(int32 i = 0; i < (int32)m_CodeSymbols.size(); i++) { Result += fmt::format("{:d} ", m_CodeSymbols[i]); } Result += "\n";
+  return Result;
+}
+bool xJFIF::xHuffTable::Validate() const
+{
+  return true;
+}
+std::vector<xJFIF::xHuffTable> xJFIF::xHuffTable::createDefaultHuffTables()
+{
+  std::vector<xHuffTable> HTs;
+  HTs.resize(4);
+  HTs[0].InitDefault(0, xJFIF::xHuffTable::tClass::DC, eCmp::LM);
+  HTs[1].InitDefault(0, xJFIF::xHuffTable::tClass::AC, eCmp::LM);
+  HTs[2].InitDefault(1, xJFIF::xHuffTable::tClass::DC, eCmp::CB); //any chroma so use CB
+  HTs[3].InitDefault(1, xJFIF::xHuffTable::tClass::AC, eCmp::CB);
+  return HTs;
+}
+
+//=============================================================================================================================================================================
+// DAC
+//=============================================================================================================================================================================
+int32 xJFIF::xArithCond::Absorb(xByteBuffer* Input)
+{
+  uint8 TabInfo = xRead8(Input );
+  m_Class = (tClass)((TabInfo & 0xF0) >> 4);
+  m_Idx   = TabInfo & 0x0F;
+  uint8 Cs      = xRead8(Input);
+  if(isDC())
+  {
+    m_U  = (Cs & 0xF0) >> 4;
+    m_L  = Cs & 0x0F;
+    m_Kx = 0xFF;
+  }
+  else
+  {
+    m_L  = 0xFF;
+    m_U  = 0xFF;
+    m_Kx = Cs  ;
+  }
+  return 2;
+}
+int32 xJFIF::xArithCond::Emit(xByteBuffer* Output) const
+{
+  xWrite8(Output, ((uint8)m_Class<<4) + m_Idx);
+  uint8 Cs = isDC() ? (m_U << 4) + m_L : m_Kx;
+  xWrite8(Output, Cs);
+  return 2;
+}
+void xJFIF::xArithCond::InitDefault(uint8 Idx, tClass Class)
+{
+  m_Class = Class;
+  m_Idx   = Idx;
+
+  if(Class == tClass::DC)
+  {
+    m_U  = xJPEG_Constants::c_DefaultU;
+    m_L  = xJPEG_Constants::c_DefaultL;
+    m_Kx = 0xFF;
+
+  }
+  else if(Class == tClass::AC)
+  {
+    m_U  = 0xFF;
+    m_L  = 0xFF;
+    m_Kx = xJPEG_Constants::c_DefaultKx;
+  }
+}
+void xJFIF::xArithCond::InitCustom(uint8 Idx, tClass Class, int32 U, int32 L, int32 Kx)
+{
+  m_Class = Class;
+  m_Idx   = Idx;
+
+  if(Class == tClass::DC)
+  {
+    m_U  = (uint8)U;
+    m_L  = (uint8)L;
+    m_Kx = 0xFF;
+
+  }
+  else if(Class == tClass::AC)
+  {
+    m_U  = 0xFF;
+    m_L  = 0xFF;
+    m_Kx = (uint8)Kx;
+  }
+}
+std::vector<xJFIF::xArithCond> xJFIF::xArithCond::createDefaultArithCond(bool CommonChroma)
+{
+  std::vector<xJFIF::xArithCond> ACs;
+  const int32 NumEntries = CommonChroma ? 4 : 6;
+  ACs.resize(NumEntries);
+  ACs[0].InitDefault(0, xArithCond::tClass::DC);
+  ACs[1].InitDefault(0, xArithCond::tClass::AC);
+  ACs[2].InitDefault(1, xArithCond::tClass::DC);
+  ACs[3].InitDefault(1, xArithCond::tClass::AC);
+  if(!CommonChroma)
+  {
+    ACs[4].InitDefault(2, xArithCond::tClass::DC);
+    ACs[5].InitDefault(2, xArithCond::tClass::AC);
+  }
+  
+  return ACs;
+}
+
+//=============================================================================================================================================================================
+// SOS
+//=============================================================================================================================================================================
+int32 xJFIF::xSOS::Absorb(xByteBuffer* Input)
+{
+  m_NumComponents  = xRead8 (Input);
+  for(int32 CmpIdx = 0; CmpIdx < m_NumComponents; CmpIdx++)
+  {
+    m_CmpId    [CmpIdx] = (eCmp)xRead8(Input);
+    m_EntropyId[CmpIdx] = xRead8(Input);
+  }
+  m_SpectralSelectionStart  = xRead8(Input);
+  m_SpectralSelectionEnd    = xRead8(Input);
+  m_SuccessiveApproximation = xRead8(Input);
+  return 4 + m_NumComponents * 2;
+}
+int32 xJFIF::xSOS::Emit(xByteBuffer* Output) const
+{
+  xWrite8 (Output, (uint8)m_NumComponents); //num components
+  for(int32 CmpIdx = 0; CmpIdx < m_NumComponents; CmpIdx++)
+  {
+    xWrite8(Output, (uint8)m_CmpId    [CmpIdx]);
+    xWrite8(Output, (uint8)m_EntropyId[CmpIdx]);
+  }
+  xWrite8(Output, (uint8)m_SpectralSelectionStart );
+  xWrite8(Output, (uint8)m_SpectralSelectionEnd   );
+  xWrite8(Output, (uint8)m_SuccessiveApproximation);
+  return 4 + m_NumComponents * 2;
+}
+void xJFIF::xSOS::InitBaseline(int32 NumComponents, int32 EntropyIdL, int32 EntropyIdC)
+{
+  m_NumComponents = NumComponents;
+  for(int32 CmpIdx = 0; CmpIdx < m_NumComponents; CmpIdx++)
+  {
+    m_CmpId[CmpIdx] = (eCmp)(CmpIdx);
+    if(CmpIdx == 0) { m_EntropyId[CmpIdx] = (((EntropyIdL & 0x03) << 4) + (EntropyIdL & 0x03)); } //Huffman table to use: DC table/AC table
+    else            { m_EntropyId[CmpIdx] = (((EntropyIdC & 0x03) << 4) + (EntropyIdC & 0x03)); } //Huffman table to use: DC table/AC table
+  }
+  m_SpectralSelectionStart  = 0;
+  m_SpectralSelectionEnd    = 63;
+  m_SuccessiveApproximation = 0;
+}
+void xJFIF::xSOS::InitExtended(int32 NumComponents, int32V4 EntropyId)
+{
+  m_NumComponents = NumComponents;
+  for(int32 CmpIdx = 0; CmpIdx < m_NumComponents; CmpIdx++)
+  {
+    m_CmpId    [CmpIdx] = (eCmp)(CmpIdx);
+    m_EntropyId[CmpIdx] = (((EntropyId[CmpIdx] & 0x03) << 4) + (EntropyId[CmpIdx] & 0x03)); //Huffman table to use: DC table/AC table
+  }
+  m_SpectralSelectionStart  = 0;
+  m_SpectralSelectionEnd    = 63;
+  m_SuccessiveApproximation = 0;
+
+}
+bool  xJFIF::xSOS::Validate() const
+{
+  return true;
+}
+
+//=============================================================================================================================================================================
+// JFIF
+//=============================================================================================================================================================================
+bool xJFIF::ReadAPP0(xByteBuffer* Input, xAPP0& APP0)
+{
+  if(xPeekMarker(Input) != eMarker::APP0) { return false; }
+
+  [[maybe_unused]]eMarker Marker        = xReadMarker(Input); //Marker
+  int32                   SegmentLength = xRead16    (Input); //Length
+
+  APP0.Absorb(Input, SegmentLength);
+  return APP0.Validate();
+}
+void xJFIF::WriteAPP0(xByteBuffer* Output, const xAPP0& APP0)
+{ 
+  xWriteMarker(Output, eMarker::APP0           ); //Marker
+  xWrite16    (Output, (uint16)APP0.getLength()); //Length
+  APP0.Emit(Output);
+}
+void xJFIF::WriteDefaultAPP0(xByteBuffer* Output)
+{ 
+  xAPP0 APP0;
+  APP0.InitDefault();
+  WriteAPP0(Output, APP0);
+}
+bool xJFIF::ReadDQT(xByteBuffer* Input , std::vector<xQuantTable>& QuantTables)
+{
+  if(xPeekMarker(Input) != eMarker::DQT) { return false; }
+
+  [[maybe_unused]]eMarker Marker        = xReadMarker(Input); //Marker
+  int32                   SegmentLength = xRead16    (Input); //Length
+
+  int32 RemainingBytes  = SegmentLength - 2;
+  while(RemainingBytes > 0)
+  {
+    xQuantTable QuantTable;
+    int32 NumBytes = QuantTable.Absorb(Input);
+    QuantTables.push_back(std::move(QuantTable));
+    RemainingBytes -= NumBytes;
+  }
+  return true;
+}
+void xJFIF::WriteDQT(xByteBuffer* Output, const std::vector<xQuantTable>& QuantTables)
+{
+  //LenField=2, QT idx=1, QT=64 or 128
+  int32 SegmentLength = 2;
+  for(const xQuantTable& QuantTable : QuantTables) { SegmentLength += QuantTable.getLength(); }
+
+  xWriteMarker(Output, eMarker::DQT         ); //marker FFDB
+  xWrite16    (Output, (uint16)SegmentLength); //length (2bytes)
+  for(const xQuantTable& QuantTable : QuantTables) { QuantTable.Emit(Output); }
+}
+bool xJFIF::ReadDRI(xByteBuffer* Input , int32& RestartInterval)
+{
+  if(xPeekMarker(Input) != eMarker::DRI) { return false; }
+
+  [[maybe_unused]]eMarker Marker        = xReadMarker(Input); //Marker
+  int32                   SegmentLength = xRead16    (Input); //Length
+  if(SegmentLength != 4) { return false; }
+
+  RestartInterval = xRead16(Input ); //restart interval (2bytes) 
+  return true;
+}
+void xJFIF::WriteDRI(xByteBuffer* Output, int32 RestartInterval)
+{
+  assert(xFitsU16(RestartInterval));
+  if(RestartInterval==0) return;
+  xWriteMarker(Output, eMarker::DRI           ); //marker FFDB
+  xWrite16    (Output, 4                      ); //length (2bytes)
+  xWrite16    (Output, (uint16)RestartInterval); //restart interval (2bytes) 
+}
+bool xJFIF::ReadSOF(xByteBuffer* Input , xSOF& SOF)
+{
+  if(!xSOF::isSOF(xPeekMarker(Input))) { return false; }
+
+  [[maybe_unused]]eMarker Marker        = xReadMarker(Input); //Marker
+  [[maybe_unused]]int32   SegmentLength = xRead16    (Input); //Length
+
+  int32 Type = (int32)Marker - (int32)eMarker::SOF0;
+  SOF.setType(Type);
+  SOF.Absorb(Input);
+  return SOF.Validate();
+}
+void xJFIF::WriteSOF(xByteBuffer* Output, const xSOF& SOF)
+{ 
+  eMarker Marker = (eMarker)(SOF.getType() + (int32)eMarker::SOF0);
+  xWriteMarker(Output, Marker                 ); //Marker - 0=baseline
+  xWrite16    (Output, (uint16)SOF.getLength()); //Length
+  SOF.Emit(Output);
+}
+void xJFIF::WriteSOF(xByteBuffer* Output, int32 Type, int32 Height, int32 Width, int32 BitDepth, eCrF ChromaFormat, int32 NumQuantTables)
+{ 
+  xSOF SOF;
+  SOF.Init(Type, Height, Width, BitDepth, ChromaFormat, NumQuantTables);
+  WriteSOF(Output, SOF);
+}
+bool xJFIF::ReadDHT(xByteBuffer* Input , std::vector<xHuffTable>& HuffTables)
+{
+  if(xPeekMarker(Input) != eMarker::DHT) { return false; }
+
+  [[maybe_unused]]eMarker Marker        = xReadMarker(Input); //Marker
+  int32                   SegmentLength = xRead16    (Input); //Length
+
+  int32 RemainingBytes = SegmentLength - 2;
+  while(RemainingBytes > 0)
+  {
+    xHuffTable HuffTable;
+    int32 NumBytes = HuffTable.Absorb(Input);
+    HuffTables.push_back(std::move(HuffTable));
+    RemainingBytes -= NumBytes;
+  }
+  return true;
+}
+void xJFIF::WriteDHT(xByteBuffer* Output, const std::vector<xHuffTable>& HuffTables)
+{
+  int32 SegmentLength = 2;
+  for(const xHuffTable& HuffTable : HuffTables) { SegmentLength += HuffTable.getLength(); }
+
+  xWriteMarker(Output, eMarker::DHT         );
+  xWrite16    (Output, (uint16)SegmentLength); //length
+  for(const xHuffTable& HuffTable : HuffTables) { HuffTable.Emit(Output); }
+}
+void xJFIF::WriteDefaultDHT(xByteBuffer* Output)
+{
+  uint16 SegmentLength = 2 + 4 * (1 + 16) + sizeof(xJPEG_Constants::m_CodeSymbolLumaDC) + sizeof(xJPEG_Constants::m_CodeSymbolLumaAC) + sizeof(xJPEG_Constants::m_CodeSymbolChromaDC) + sizeof(xJPEG_Constants::m_CodeSymbolChromaAC);
+
+  xWriteMarker(Output, eMarker::DHT);
+  xWrite16(Output, SegmentLength); //length
+
+  xWrite8(Output, (0<<4) + 0);
+  xWriteMemmory(Output, xJPEG_Constants::m_CodeLengthLumaDC, 16);
+  xWriteMemmory(Output, xJPEG_Constants::m_CodeSymbolLumaDC, sizeof(xJPEG_Constants::m_CodeSymbolLumaDC));
+
+  xWrite8(Output, (1<<4) + 0);
+  xWriteMemmory(Output, xJPEG_Constants::m_CodeLengthLumaAC, 16);
+  xWriteMemmory(Output, xJPEG_Constants::m_CodeSymbolLumaAC, sizeof(xJPEG_Constants::m_CodeSymbolLumaAC));
+
+  xWrite8(Output, (0<<4) + 1);
+  xWriteMemmory(Output, xJPEG_Constants::m_CodeLengthChromaDC, 16);
+  xWriteMemmory(Output, xJPEG_Constants::m_CodeSymbolChromaDC, sizeof(xJPEG_Constants::m_CodeSymbolChromaDC));
+
+  xWrite8(Output, (1<<4) + 1);
+  xWriteMemmory(Output, xJPEG_Constants::m_CodeLengthChromaAC, 16);
+  xWriteMemmory(Output, xJPEG_Constants::m_CodeSymbolChromaAC, sizeof(xJPEG_Constants::m_CodeSymbolChromaAC));
+}
+bool xJFIF::ReadDAC(xByteBuffer* Input, std::vector<xArithCond>& ArithConds)
+{
+  if(xPeekMarker(Input) != eMarker::DAC) { return false; }
+
+  [[maybe_unused]]eMarker Marker        = xReadMarker(Input); //Marker
+  int32                   SegmentLength = xRead16    (Input); //Length
+
+  int32 RemainingBytes = SegmentLength - 2;
+  while(RemainingBytes > 0)
+  {
+    xArithCond ArithCond;
+    int32 NumBytes = ArithCond.Absorb(Input);
+    ArithConds.push_back(std::move(ArithCond));
+    RemainingBytes -= NumBytes;
+  }
+  return true;
+}
+void xJFIF::WriteDAC(xByteBuffer* Output, const std::vector<xArithCond>& ArithConds)
+{
+  int32 SegmentLength = 2;
+  for(const xArithCond& ArithCond : ArithConds) { SegmentLength += ArithCond.getLength(); }
+
+  xWriteMarker(Output, eMarker::DAC         );
+  xWrite16    (Output, (uint16)SegmentLength); //length
+  for(const xArithCond& ArithCond : ArithConds) { ArithCond.Emit(Output); }
+}
+bool xJFIF::ReadSOS(xByteBuffer* Input, xSOS& SOS)
+{
+  if(xPeekMarker(Input) != eMarker::SOS) { return false; }
+
+  [[maybe_unused]]eMarker Marker        = xReadMarker(Input); //Marker
+  [[maybe_unused]]int32   SegmentLength = xRead16    (Input); //Length
+
+  SOS.Absorb(Input);
+  return SOS.Validate();
+}
+bool xJFIF::SkipSOS(xByteBuffer* Input)
+{
+  if(xPeekMarker(Input) != eMarker::SOS) { return false; }
+
+  [[maybe_unused]]eMarker Marker        = xReadMarker(Input); //Marker
+  int32                   SegmentLength = xRead16(Input); //Length
+  xSkip(Input, SegmentLength - 2);
+  return true;
+}
+void xJFIF::WriteSOS(xByteBuffer* Output, const xSOS& SOS)
+{
+  xWriteMarker(Output, eMarker::SOS           ); //Marker
+  xWrite16    (Output, (uint16)SOS.getLength()); //Length
+  SOS.Emit(Output);
+}
+void xJFIF::WriteSOS(xByteBuffer* Output, int32 NumComponents, int32 LumaHuffTabIdx, int32 ChromaHuffTabIdx)
+{
+  xSOS SOS;
+  SOS.InitBaseline(NumComponents, LumaHuffTabIdx, ChromaHuffTabIdx);
+  WriteSOS(Output, SOS);
+}
+int8 xJFIF::ReadRST(xByteBuffer* Input)
+{
+  eMarker Marker = xReadMarker(Input);
+  if(Marker != eMarker::ERR) { return (uint8)Marker & 0x07; }
+  else                       { return NOT_VALID;            }
+}
+void xJFIF::WriteRST(xByteBuffer* Output, uint8 RestartIdx)
+{
+  RestartIdx = RestartIdx & 0x07;
+  eMarker Marker = (eMarker)((uint8)eMarker::RST0 | RestartIdx);
+  xWriteMarker(Output, Marker);
+}
+int32 xJFIF::FindMarker(xByteBuffer* Input, eMarker Marker)
+{
+  byte* Ptr = Input->getReadPtr();
+  byte* End = Ptr + Input->getDataSize();
+
+  if(Marker != eMarker::ERR) //selected marker
+  {
+    while(Ptr != End)
+    {
+      if(*Ptr == 0xFF)
+      {
+        if(((End - Ptr) > 1) && *(Ptr + 1) == (byte)Marker)
+        {
+          int32 Pos = (int32)(Ptr - Input->getReadPtr());
+          return Pos;
+        }
+      }
+      Ptr++;
+    }
+  }
+  else //any marker
+  {
+    while(Ptr != End)
+    {
+      if(*Ptr == 0xFF)
+      {
+        if(((End - Ptr) > 1) && *(Ptr + 1) > 0)
+        {
+          int32 Pos = (int32)(Ptr - Input->getReadPtr());
+          return Pos;
+        }
+      }
+      Ptr++;
+    }
+  }
+  if(*(Ptr - 1) == 0xFF)
+  {
+    return -2;
+  }
+  return -1;
+}
+xJFIF::tPosV xJFIF::SeekAllMarkers(xStream* File, eMarker Marker, int32 SeekBufferSize)
+{
+  tPosV Positions;
+
+  xByteBuffer SeekBuffer(SeekBufferSize);  
+
+  do
+  {
+    int64 FilePos = File->tellR();
+    SeekBuffer.reset();
+    SeekBuffer.read(File);
+    int32 Pos = xJFIF::FindMarker(&SeekBuffer, Marker);
+    while(Pos >= 0)
+    {      
+      int64 AbsPos = FilePos + Pos;
+      Positions.push_back(AbsPos);
+      SeekBuffer.modifyRead(2+Pos);
+      Pos = xJFIF::FindMarker(&SeekBuffer, Marker);
+    }    
+
+    if(Pos == -2)
+    {
+      File->seekR(-1, xStream::eSeek::Cur);
+    }
+  }
+  while(!File->end());
+
+  return Positions;
+}
+
+//=============================================================================================================================================================================
+
+} //end of namespace PMBB_NAMESPACE::JPEG
